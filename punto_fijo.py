@@ -54,6 +54,9 @@ def entorno_math():
 #  MÉTODO DE PUNTO FIJO
 #  Itera xₙ₊₁ = g(xₙ) hasta que el error relativo sea ≤ tolerancia
 # ──────────────────────────────────────────────
+# NOTA:
+# El criterio de parada usa error relativo entre iteraciones.
+# Esto no garantiza que f(x) = 0, solo que la secuencia converge.
 def punto_fijo(g_expr, x0, tol, max_iter=100):
     g_expr = preprocesar(g_expr)
     allowed = entorno_math()
@@ -93,6 +96,9 @@ def punto_fijo(g_expr, x0, tol, max_iter=100):
 #  A partir de f(x) = 0 produce varias reescrituras x = g(x)
 #  usando álgebra simbólica básica sobre la expresión de texto.
 # ──────────────────────────────────────────────
+# NOTA:
+# No todas las transformaciones g(x) garantizan convergencia.
+# La condición ideal es |g'(x)| < 1 cerca de la raíz.
 def generar_candidatas_gx(f_expr_raw, x0):
     """
     Recibe f(x) como texto y devuelve una lista de tuplas
@@ -124,12 +130,6 @@ def generar_candidatas_gx(f_expr_raw, x0):
 
     # ── Estrategia 5: Newton-like con h pequeño ──
     # g(x) = x - f(x)/f'(x)  aproximando f'(x) ≈ (f(x+h)-f(x))/h
-    h = 1e-5
-    newton_expr = (
-        f"x - ({f}) / (( ({f_safe}) - ({f}) ) / {h})"
-        .replace("{f_safe}", f.replace("x", f"(x+{h})"))
-    )
-    # Construcción limpia de la aproximación de Newton
     candidatas.append((
         "x - f(x)/f'(x)  [Newton aprox.]",
         f"x - ({f}) / (({f.replace('x', '(x+1e-5)')}) - ({f})) * 1e-5"
@@ -139,28 +139,121 @@ def generar_candidatas_gx(f_expr_raw, x0):
 
 
 # ──────────────────────────────────────────────
+#  DETECTOR DE DISCONTINUIDADES / ASÍNTOTAS
+#  Evalúa f cerca de x para detectar valores explosivos o no finitos
+#  que indican una asíntota (ejemplo: tan(x) cerca de π/2, 3π/2...).
+# ──────────────────────────────────────────────
+def cerca_de_asintota(f_expr, x, umbral=1e6):
+    """
+    Evalúa f_expr en x y en puntos ligeramente desplazados.
+    Si algún valor absoluto supera `umbral` o no es finito,
+    asume que x está cerca de una discontinuidad vertical.
+
+    Parámetros:
+        f_expr : expresión de f(x) ya preprocesada con preprocesar()
+        x      : punto a evaluar
+        umbral : magnitud a partir de la cual se sospecha asíntota
+
+    Retorna True si hay riesgo de discontinuidad, False si el punto es seguro.
+    """
+    allowed = entorno_math()
+    errores = 0
+
+    for d in [0, 1e-6, -1e-6]:
+        try:
+            local = dict(allowed)
+            local["x"] = x + d
+            val = eval(f_expr, {"__builtins__": {}}, local)
+
+            if not math.isfinite(val) or abs(val) > umbral:
+                errores += 1
+
+        except Exception:
+            errores += 1
+
+    # Solo marcar como peligrosa si hay múltiples fallos
+    return errores >= 2
+
+
+# ──────────────────────────────────────────────
+#  DETECTOR DE OSCILACIÓN / DIVERGENCIA EXPLOSIVA
+#  Compara el error promedio de la primera y segunda mitad de una
+#  ventana de iteraciones recientes para identificar tendencias crecientes.
+# ──────────────────────────────────────────────
+def detectar_divergencia(historial, ventana=6, factor=8):
+    """
+    Examina las últimas `ventana` iteraciones del historial.
+    Si el error promedio de la segunda mitad es `factor` veces mayor
+    al de la primera mitad, clasifica la secuencia como divergente.
+
+    Parámetros:
+        historial : lista de dicts con al menos la clave 'error'
+        ventana   : iteraciones recientes a considerar
+        factor    : razón de crecimiento que se considera explosiva
+
+    Retorna True si se detecta divergencia, False si la tendencia es estable.
+    """
+    if len(historial) < ventana:
+        return False  # Sin suficientes datos todavía
+
+    recientes = historial[-ventana:]
+    mitad     = ventana // 2
+    primera   = [it["error"] for it in recientes[:mitad]]
+    segunda   = [it["error"] for it in recientes[mitad:]]
+
+    prom1 = sum(primera) / len(primera) if primera else 0
+    prom2 = sum(segunda) / len(segunda) if segunda else 0
+
+    # Divergencia sostenida: la segunda mitad de la ventana es `factor` veces peor
+    if prom1 > 0 and (prom2 / prom1) > factor:
+        return True
+
+    # Divergencia inmediata: error reciente absurdamente alto (>50 = 5000%)
+    if any(it["error"] > 50 for it in recientes[-2:]):
+        return True
+
+    return False
+
+
+# ──────────────────────────────────────────────
 #  VERIFICADOR DE CONVERGENCIA
-#  Prueba cada g(x) candidata y devuelve la primera que converge
+#  Prueba cada g(x) candidata y devuelve la primera que converge.
+#
+#  Mejoras implementadas:
+#    · cerca_de_asintota(): filtra x0 que caigan en zonas peligrosas de f
+#    · Filtro de salto abrupto entre iteraciones consecutivas (|Δx| > 1e5)
+#    · detectar_divergencia(): abandona candidatas con error explosivo
+#    · Todos los filtros están comentados indicando qué caso cubren
 # ──────────────────────────────────────────────
 def buscar_gx_convergente(f_expr, x0, tol, max_iter=50):
     """
-    Intenta las candidatas de g(x) en orden.
-    Una candidata "converge" si:
+    Intenta las candidatas de g(x) generadas a partir de f(x).
+    Una candidata se considera convergente si:
+      - x0 no produce valores explosivos al evaluar f (sin asíntotas cercanas)
       - No lanza excepciones durante las iteraciones
       - Los valores xₙ permanecen acotados (|xₙ| < 1e8)
-      - El error decrece y cae por debajo de la tolerancia
+      - No hay saltos abruptos entre pasos consecutivos (|Δx| < 1e5)
+      - No se detecta divergencia explosiva sostenida
+      - El error relativo cae por debajo de la tolerancia ε
 
-    Retorna (descripcion, g_expr, iteraciones) de la primera que converge,
-    o None si ninguna converge.
+    Parámetros:
+        f_expr   : función f(x) ingresada por el usuario (sin preprocesar)
+        x0       : punto inicial de la iteración
+        tol      : tolerancia de parada (error relativo)
+        max_iter : máximo de iteraciones de prueba por candidata
+
+    Retorna (descripcion, g_expr, iteraciones) de la primera candidata
+    que converge, o None si ninguna supera todos los filtros.
     """
     candidatas = generar_candidatas_gx(f_expr, x0)
-    allowed = entorno_math()
+    allowed    = entorno_math()
+    f_prepro   = preprocesar(f_expr)  # Versión preprocesada para chequeos auxiliares
 
     for desc, g_expr_raw in candidatas:
         g_expr = preprocesar(g_expr_raw)
 
         def hacer_g(expr):
-            """Cierre para capturar expr correctamente en el bucle."""
+            """Cierre que captura `expr` por valor para evitar la trampa del bucle."""
             def g(x):
                 local = dict(allowed)
                 local["x"] = x
@@ -170,37 +263,55 @@ def buscar_gx_convergente(f_expr, x0, tol, max_iter=50):
         g = hacer_g(g_expr)
 
         try:
-            x = x0
-            convergio = False
+            x            = x0
+            convergio    = False
             iters_prueba = []
 
             for i in range(1, max_iter + 1):
                 gx = g(x)
 
-                # Detectar divergencia: valores que explotan
+                # ── Filtro 1: NaN / Inf / desbordamiento ────────────────────
+                # Cubre asíntotas verticales (tan cerca de π/2) y overflow.
                 if not math.isfinite(gx) or abs(gx) > 1e8:
                     break
 
-                gx_r = round(gx, 4)
-                x_r  = round(x, 4)
+                # ── Filtro 2: salto abrupto entre pasos consecutivos ─────────
+                # Si la iteración cruza una asíntota el valor cambia en
+                # varios órdenes de magnitud de un paso al siguiente.
+                if iters_prueba and abs(gx - iters_prueba[-1]["gxn"]) > 1e5:
+                    break
+
+                gx_r  = round(gx, 4)
+                x_r   = round(x,  4)
                 error = abs((gx_r - x_r) / gx_r) if gx_r != 0 else abs(gx_r - x_r)
                 iters_prueba.append({"n": i, "xn": x_r, "gxn": gx_r, "error": error})
 
+                # ── Criterio de convergencia ─────────────────────────────────
                 if error <= tol:
                     convergio = True
                     break
+
+                # ── Filtro 3: divergencia sostenida en ventana reciente ───────
+                # Detecta cuando el error crece de forma explosiva y sostenida
+                # (no solo un pico puntual), lo que indica que la candidata
+                # no converge aunque eventualmente pueda estabilizarse por azar.
+                if detectar_divergencia(iters_prueba):
+                    break
+
                 x = gx
 
             if convergio:
-                # Rellenar iteraciones completas con la g(x) ganadora
+                # Recalcular las iteraciones completas con la g(x) ganadora
+                # para garantizar coherencia total en tabla y gráficas.
                 iters_completas = punto_fijo(g_expr_raw, x0, tol)
                 return desc, g_expr_raw, iters_completas
 
         except Exception:
-            # Esta candidata falló matemáticamente; probar la siguiente
+            # Error matemático en esta candidata (dominio, div/0, etc.)
+            # No es fatal: simplemente se descarta y se prueba la siguiente.
             continue
 
-    return None  # Ninguna candidata convergió
+    return None  # Ninguna candidata superó todos los filtros
 
 
 # ──────────────────────────────────────────────
@@ -309,6 +420,39 @@ MANUAL_SECCIONES = [
             "  →  Cambia x₀ para dirigir el método hacia otra raíz."
         )
     },
+    {
+        "titulo": "Funciones con discontinuidades (tan, cot, sec...)",
+        "icono": "⚡",
+        "color": WARNING,
+        "contenido": (
+            "Funciones como tan(x), cot(x) o 1/sin(x) tienen asíntotas verticales\n"
+            "donde el valor se dispara a ±∞. Si x₀ cae cerca de esos puntos,\n"
+            "el método puede oscilar o divergir de forma caótica.\n\n"
+            "Asíntotas de tan(x):  x = π/2 ≈ 1.5708,  3π/2 ≈ 4.7124,  5π/2 ≈ 7.8540...\n\n"
+            "El programa detecta automáticamente estos casos y:\n"
+            "  · Descarta candidatas que crucen una asíntota durante la iteración.\n"
+            "  · Muestra una advertencia específica si x₀ está en zona peligrosa.\n\n"
+            "Solución: elige x₀ en el mismo 'tramo continuo' que la raíz buscada.\n"
+            "  Ej: para tan(x) − x con raíz en x ≈ 0, usa x₀ = 0.1 (no 4.5).\n"
+            "  Ej: para la raíz en x ≈ 7.79, usa x₀ = 7.5 (entre 3π/2 y 5π/2)."
+        )
+    },
+    {
+        "titulo": "Aclaración del criterio de parada",
+        "icono": "⚠",
+        "color": ACCENT2,
+        "contenido": (
+            "El criterio de finalización se basa en el error relativo entre iteraciones:\n\n"
+            "        ε = |xₙ₊₁ − xₙ| / |xₙ₊₁|\n\n"
+            "Cuando ε es menor que la tolerancia, el método se detiene.\n\n"
+            "IMPORTANTE:\n"
+            "Un error pequeño indica que las iteraciones se han estabilizado,\n"
+            "pero NO garantiza que el valor encontrado sea una raíz de f(x).\n\n"
+            "En algunos casos, el método puede converger a un punto fijo de g(x)\n"
+            "que no cumple f(x) = 0.\n\n"
+            "Por ello, es recomendable verificar el resultado evaluando f(xₙ)."
+        )
+    }
 ]
 
 
@@ -641,15 +785,29 @@ class PuntoFijoApp:
         resultado = buscar_gx_convergente(f_expr, x0, tol)
 
         if resultado is None:
-            # Ninguna candidata convergió
-            messagebox.showerror(
-                "Sin convergencia",
-                "No se encontró una g(x) que converja con el x₀ dado.\n\n"
-                "Sugerencias:\n"
-                "• Cambia x₀ a un valor más cercano a la raíz.\n"
-                "• Verifica que f(x) esté bien escrita.\n"
-                "• Asegúrate de que f(x) tenga una raíz cerca de x₀."
-            )
+            # Diagnóstico adicional: verificar si x0 está cerca de una asíntota
+            f_prepro = preprocesar(f_expr)
+            advertencia_asintota = cerca_de_asintota(f_prepro, x0)
+
+            if advertencia_asintota:
+                detalle = (
+                    "⚠ x₀ parece estar cerca de una discontinuidad o asíntota de f(x).\n\n"
+                    "Por ejemplo, tan(x) tiene asíntotas en x = π/2, 3π/2, ...\n"
+                    "Intenta un x₀ alejado de esos puntos.\n\n"
+                    "Sugerencias:\n"
+                    "• Para tan(x) − x, prueba x₀ cercano a 0 (ej: 0.1)\n"
+                    "• Verifica que f(x₀) esté bien definida y sea finita."
+                )
+            else:
+                detalle = (
+                    "No se encontró una g(x) que converja con el x₀ dado.\n\n"
+                    "Sugerencias:\n"
+                    "• Cambia x₀ a un valor más cercano a la raíz.\n"
+                    "• Verifica que f(x) esté bien escrita.\n"
+                    "• Asegúrate de que f(x) tenga una raíz cerca de x₀."
+                )
+
+            messagebox.showerror("Sin convergencia", detalle)
             return
 
         desc_gx, g_expr_usada, iters = resultado
